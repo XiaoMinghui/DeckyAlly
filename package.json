@@ -1,6 +1,6 @@
 {
   "name": "decky-ally",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Automatic post-resume controller recovery for ROG Ally X on SteamOS",
   "type": "module",

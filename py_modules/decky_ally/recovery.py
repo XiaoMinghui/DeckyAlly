@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import time
 
-from .system import classify, read, run
+from .system import classify, command_environment, read, run
 
 DEFAULTS = {"enabled": True, "mode": "always", "delay_seconds": 5}
 
@@ -314,7 +314,7 @@ class Recovery:
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "dbus-monitor", "--system", match, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL, env={**os.environ, "LC_ALL": "C"},
+                    stderr=asyncio.subprocess.DEVNULL, env=command_environment(),
                 )
                 self.monitor_proc = proc
                 self.state["monitor"] = "logind_and_clock"

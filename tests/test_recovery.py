@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "py_modules"))
 
 from decky_ally.recovery import Recovery, atomic_json, load_settings, validate_settings
-from decky_ally.system import System, classify, hardware, host_info, parse_property, run
+from decky_ally.system import System, classify, command_environment, hardware, host_info, parse_property, run
 
 REAL_SLEEP = asyncio.sleep
 
@@ -330,11 +330,14 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 done.set()
         engine.sleep_event = received
         with patch("decky_ally.recovery.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=proc) as spawn:
-            task = asyncio.create_task(engine.dbus_watch())
-            await asyncio.wait_for(done.wait(), timeout=1)
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            self.assertIn("sender='org.freedesktop.login1'", spawn.call_args.args[2])
+            with patch.dict(os.environ, {"LD_LIBRARY_PATH": "/tmp/decky", "LD_PRELOAD": "/tmp/decky/preload.so"}):
+                task = asyncio.create_task(engine.dbus_watch())
+                await asyncio.wait_for(done.wait(), timeout=1)
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                self.assertIn("sender='org.freedesktop.login1'", spawn.call_args.args[2])
+                self.assertNotIn("LD_LIBRARY_PATH", spawn.call_args.kwargs["env"])
+                self.assertNotIn("LD_PRELOAD", spawn.call_args.kwargs["env"])
         self.assertEqual(events, [True, False])
         self.assertEqual(proc.returncode, -9)
 
@@ -349,6 +352,21 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CommandTests(unittest.IsolatedAsyncioTestCase):
+    def test_command_environment_removes_decky_loader_overrides(self):
+        inherited = {
+            "LD_LIBRARY_PATH": "/tmp/.mount_decky/usr/lib",
+            "LD_PRELOAD": "/tmp/.mount_decky/usr/lib/injected.so",
+            "LD_AUDIT": "audit.so",
+            "DECKY_MARKER": "preserved",
+        }
+        with patch.dict(os.environ, inherited, clear=False):
+            env = command_environment()
+        self.assertFalse(any(name.startswith("LD_") for name in env))
+        self.assertEqual(env["DECKY_MARKER"], "preserved")
+        self.assertEqual(env["LC_ALL"], "C")
+        self.assertEqual(env["SYSTEMD_COLORS"], "0")
+        self.assertIn("/usr/bin", env["PATH"])
+
     async def test_timeout_reaps_process(self):
         result = await run(sys.executable, "-c", "import time; time.sleep(10)", timeout=0.1)
         self.assertEqual(result["code"], -1)

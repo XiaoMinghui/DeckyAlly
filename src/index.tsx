@@ -133,7 +133,7 @@ function Content() {
           <div>{status.host?.product || "设备信息加载中"}</div>
           {status.host && <div>SteamOS {status.host.os_version} · {status.host.kernel}</div>}
           <div style={{ marginTop: 8 }}>诊断自动保存：{status.log_path || "加载中"}</div>
-          <div style={{ marginTop: 8 }}>0.1.0 实验版 · 尚未在 Ally X 真机验证恢复效果。</div>
+          <div style={{ marginTop: 8 }}>0.1.1 实验版 · 已修复真机发现的系统工具动态库冲突，恢复效果待复测。</div>
         </div>
       </PanelSectionRow>
     </PanelSection>

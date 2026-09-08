@@ -13,6 +13,19 @@ SERVICE = "inputplumber.service"
 BUS = "org.shadowblip.InputPlumber"
 IFACE = "org.shadowblip.Input.CompositeDevice"
 PREFIX = "/org/shadowblip/InputPlumber"
+SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def command_environment():
+    """Return an environment safe for SteamOS host tools.
+
+    Decky may run from an AppImage and inject LD_LIBRARY_PATH. Passing that to
+    host binaries can make systemctl load Decky's libcrypto instead of the
+    SteamOS copy, so discard every dynamic-loader override for child commands.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("LD_")}
+    env.update({"PATH": SYSTEM_PATH, "LC_ALL": "C", "SYSTEMD_COLORS": "0"})
+    return env
 
 
 async def run(*args, timeout=5):
@@ -20,7 +33,7 @@ async def run(*args, timeout=5):
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "LC_ALL": "C", "SYSTEMD_COLORS": "0"},
+            env=command_environment(),
         )
     except OSError as exc:
         return {"code": -1, "out": "", "error": str(exc)}
@@ -109,7 +122,8 @@ def parse_property(raw):
 class System:
     def __init__(self):
         self.host = host_info()
-        self.tools = {name: shutil.which(name) for name in ("systemctl", "busctl", "dbus-monitor", "journalctl")}
+        self.tools = {name: shutil.which(name, path=SYSTEM_PATH)
+                      for name in ("systemctl", "busctl", "dbus-monitor", "journalctl")}
 
     async def service(self, name=SERVICE):
         result = await run("systemctl", "show", name, "--no-pager",

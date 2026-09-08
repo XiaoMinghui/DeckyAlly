@@ -2,7 +2,7 @@
 
 ROG Ally X（2024，RC72LA）在 SteamOS 上使用的 Decky 插件。首个功能是**系统唤醒后自动尝试恢复内置手柄**，整个过程由 Python 后台执行，不需要按键、不需要打开 Decky 面板，也没有手动恢复按钮。
 
-**当前版本：0.1.0 实验版。已完成本地自动化测试和前端构建，尚无 Ally X 真机验证。重启 InputPlumber 是否能解决你的故障仍未确认。**
+**当前版本：0.1.1 实验版。已在 Ally X 真机确认安装、后台启动及唤醒检测；本版修复了 Decky/AppImage 动态库环境导致 SteamOS 系统工具无法运行的问题。自动恢复实际按键的效果仍需用本版复测。**
 
 ## 默认行为
 
@@ -27,13 +27,13 @@ ROG Ally X（2024，RC72LA）在 SteamOS 上使用的 Decky 插件。首个功�
 
 ## 安装
 
-安装包：`artifacts/DeckyAlly-0.1.0.zip`，旁边提供 SHA-256 文件。包内已经包含前端构建产物和 Python 模块，**设备端无需 npm、pip 或编译**。
+安装包：`artifacts/DeckyAlly-0.1.1.zip`，旁边提供 SHA-256 文件。包内已经包含前端构建产物和 Python 模块，**设备端无需 npm、pip 或编译**。
 
 设备在身边后，将 ZIP 传到 Ally X 的下载目录。在桌面模式终端中执行以下命令（假定 Decky 安装在当前用户的 `~/homebrew`，ZIP 文件名保持不变）：
 
 ```bash
 sudo mkdir -p "$HOME/homebrew/plugins"
-sudo unzip -o "$HOME/Downloads/DeckyAlly-0.1.0.zip" -d "$HOME/homebrew/plugins"
+sudo unzip -o "$HOME/Downloads/DeckyAlly-0.1.1.zip" -d "$HOME/homebrew/plugins"
 sudo systemctl restart plugin_loader.service
 ```
 
