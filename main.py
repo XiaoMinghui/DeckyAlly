@@ -30,6 +30,11 @@ class Plugin:
             raise RuntimeError("Backend is starting")
         return await self.recovery.configure(settings)
 
+    async def set_lock_state(self, locked: bool):
+        if not hasattr(self, "recovery"):
+            raise RuntimeError("Backend is starting")
+        return self.recovery.set_lock_state(locked)
+
     async def _unload(self):
         if hasattr(self, "recovery"):
             await self.recovery.stop()

@@ -11,7 +11,7 @@ import time
 
 from .system import classify, command_environment, read, run
 
-DEFAULTS = {"enabled": True, "mode": "always", "delay_seconds": 5}
+DEFAULTS = {"enabled": True, "mode": "conditional", "delay_seconds": 8}
 
 
 def boot_time():
@@ -54,7 +54,11 @@ def validate_settings(values):
     result = {**DEFAULTS, **values}
     if type(result["enabled"]) is not bool:
         raise ValueError("enabled must be boolean")
-    if result["mode"] not in ("always", "conditional"):
+    # v0.1.0-v0.1.1 exposed an always-restart policy. Normalize persisted
+    # settings so upgrading cannot keep disrupting a healthy controller.
+    if result["mode"] == "always":
+        result["mode"] = "conditional"
+    elif result["mode"] != "conditional":
         raise ValueError("Unsupported recovery mode")
     if type(result["delay_seconds"]) is not int or not 3 <= result["delay_seconds"] <= 15:
         raise ValueError("Delay must be an integer from 3 to 15 seconds")
@@ -88,12 +92,21 @@ class Recovery:
         self.logger.addHandler(self.handler)
         self.state = {"phase": "starting", "reason": "", "last_result": None, "last_check": None,
                       "host": system.host, "tools": system.tools, "monitor": "starting",
-                      "log_path": str(self.log_path), "settings_error": settings_error}
+                      "log_path": str(self.log_path), "settings_error": settings_error,
+                      "screen_locked": True}
         self.baseline = None
         self.cycle = None
+        self.cycle_source = None
+        self.pending_resume_source = None
         self.tasks = []
+        self.baseline_probe = None
         self.closed = False
         self.suspended = False
+        # Stay inert until the Steam UI explicitly reports its lock state.
+        self.screen_locked = True
+        self.lock_state_known = False
+        self.lock_revision = 0
+        self.unlocked = asyncio.Event()
         self.last_resume = -1000000.0
         self.offset = sleep_offset()
         self.monitor_proc = None
@@ -118,8 +131,41 @@ class Recovery:
         self.state["settings_error"] = ""
         await self.cancel_cycle()
         if self.state["phase"] != "unsupported":
-            self.phase("idle" if candidate["enabled"] else "disabled")
+            self.phase("locked" if self.screen_locked else ("idle" if candidate["enabled"] else "disabled"))
         self.record("settings_changed", settings=candidate)
+        return self.status()
+
+    def set_lock_state(self, locked):
+        if type(locked) is not bool:
+            raise ValueError("Lock state must be boolean")
+        changed = not self.lock_state_known or locked != self.screen_locked
+        self.lock_state_known = True
+        if not changed:
+            return self.status()
+        self.screen_locked = locked
+        self.lock_revision += 1
+        self.state["screen_locked"] = locked
+        unsupported = self.state["phase"] == "unsupported"
+        if locked:
+            self.unlocked.clear()
+            if self.baseline_probe and not self.baseline_probe.done():
+                self.baseline_probe.cancel()
+            if self.cycle and not self.cycle.done():
+                self.pending_resume_source = self.cycle_source or self.pending_resume_source
+                self.cycle.cancel()
+            if not unsupported:
+                self.phase("locked")
+        else:
+            self.unlocked.set()
+            source = self.pending_resume_source
+            self.pending_resume_source = None
+            if source and self.settings["enabled"] and not self.suspended and not unsupported:
+                previous = self.cycle
+                self.cycle_source = source
+                self.cycle = asyncio.create_task(self.after_previous(previous, source))
+            elif not (self.cycle and not self.cycle.done()) and not unsupported:
+                self.phase("idle" if self.settings["enabled"] else "disabled")
+        self.record("lock_state", locked=locked)
         return self.status()
 
     async def start(self):
@@ -144,7 +190,8 @@ class Recovery:
             self.phase("unsupported", "another_backend_running")
             self.state["monitor"] = "unavailable"
             return
-        self.phase("idle" if self.settings["enabled"] else "disabled")
+        self.phase("locked" if not self.lock_state_known or self.screen_locked
+                   else ("idle" if self.settings["enabled"] else "disabled"))
         self.tasks = [asyncio.create_task(self.clock_watch()), asyncio.create_task(self.baseline_watch())]
         if self.system.tools.get("dbus-monitor"):
             self.tasks.append(asyncio.create_task(self.dbus_watch()))
@@ -162,8 +209,18 @@ class Recovery:
             return
         if sleeping:
             self.suspended = True
+            # A wake may expose the lock screen before the Steam UI can report
+            # it. Close the gate now and require a fresh UI state afterward.
+            self.screen_locked = True
+            self.lock_state_known = False
+            self.lock_revision += 1
+            self.unlocked.clear()
+            self.state["screen_locked"] = True
+            self.pending_resume_source = None
             if self.cycle and not self.cycle.done():
                 self.cycle.cancel()
+            if self.baseline_probe and not self.baseline_probe.done():
+                self.baseline_probe.cancel()
             self.phase("sleeping")
             self.record("suspend", baseline=self.baseline)
         else:
@@ -185,6 +242,11 @@ class Recovery:
         if not self.settings["enabled"]:
             self.phase("disabled")
             return
+        self.cycle_source = source
+        if self.screen_locked:
+            self.pending_resume_source = source
+            self.phase("locked")
+            return
         self.cycle = asyncio.create_task(self.after_previous(previous, source))
 
     async def after_previous(self, previous, source):
@@ -193,11 +255,23 @@ class Recovery:
             await asyncio.gather(previous, return_exceptions=True)
         await self.recover(source)
 
+    async def wait_for_unlock_and_settle(self):
+        """Do not inspect or restart anything until one full unlocked grace period."""
+        while True:
+            if self.screen_locked:
+                self.phase("locked")
+            await self.unlocked.wait()
+            revision = self.lock_revision
+            self.phase("waiting")
+            await asyncio.sleep(self.settings["delay_seconds"])
+            if not self.screen_locked and revision == self.lock_revision:
+                return
+
     async def snapshot(self):
         try:
             value = await asyncio.wait_for(self.system.snapshot(), timeout=12)
         except Exception as exc:
-            # Probe failure is uncertainty, not a reason to block the always-on policy.
+            # Probe failure is uncertainty and must never trigger a disruptive restart.
             value = {"service": {"error": str(exc) or "probe timeout"},
                      "hardware": {"usb": [], "hidraw": []}, "devices": None,
                      "probe_error": str(exc) or "probe timeout"}
@@ -207,13 +281,20 @@ class Recovery:
 
     async def baseline_watch(self):
         while not self.closed:
-            if not self.suspended and not (self.cycle and not self.cycle.done()):
+            if not self.suspended and not self.screen_locked and not (self.cycle and not self.cycle.done()):
                 try:
-                    value, health, _ = await self.snapshot()
-                    if health == "ready" and not self.suspended and not (self.cycle and not self.cycle.done()):
+                    self.baseline_probe = asyncio.create_task(self.snapshot())
+                    value, health, _ = await self.baseline_probe
+                    if (health == "ready" and not self.suspended and not self.screen_locked
+                            and not (self.cycle and not self.cycle.done())):
                         self.baseline = value
+                except asyncio.CancelledError:
+                    if self.closed:
+                        raise
                 except Exception as exc:
                     self.record("baseline_probe_error", error=str(exc))
+                finally:
+                    self.baseline_probe = None
             await asyncio.sleep(60)
 
     async def guard(self):
@@ -246,28 +327,26 @@ class Recovery:
 
     async def recover(self, source):
         try:
-            self.phase("waiting")
-            await asyncio.sleep(self.settings["delay_seconds"])
+            await self.wait_for_unlock_and_settle()
             before, health, reason = await self.snapshot()
             self.record("before_recovery", source=source, health=health, reason=reason, snapshot=before)
-            if self.settings["mode"] == "conditional":
-                # Require three consecutive abnormal observations; unknown is never a failure.
-                for _ in range(2):
-                    if health != "abnormal":
-                        break
-                    await asyncio.sleep(2)
-                    before, health, reason = await self.snapshot()
-                    self.record("recheck", health=health, reason=reason, snapshot=before)
+            # Require three consecutive abnormal observations; unknown is never a failure.
+            for _ in range(2):
                 if health != "abnormal":
-                    await self.finish("observed" if health == "ready" else "unknown", reason)
-                    return
+                    break
+                await asyncio.sleep(2)
+                before, health, reason = await self.snapshot()
+                self.record("recheck", health=health, reason=reason, snapshot=before)
+            if health != "abnormal":
+                await self.finish("observed" if health == "ready" else "unknown", reason)
+                return
             journal = await self.system.journal()
             self.record("journal_before", **journal)
             blocked = await self.guard()
             if blocked:
                 await self.finish("skipped", blocked)
                 return
-            if self.suspended or not self.settings["enabled"]:
+            if self.suspended or self.screen_locked or not self.settings["enabled"]:
                 return
             # Reserve before the systemd request: a crash/reload cannot bypass cooldown.
             self.last_attempt = boot_time()

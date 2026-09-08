@@ -3,7 +3,7 @@ import { callable, definePlugin } from "@decky/api";
 import { PanelSection, PanelSectionRow, ToggleField, SliderField, staticClasses } from "@decky/ui";
 import { FaGamepad } from "react-icons/fa";
 
-type Settings = { enabled: boolean; mode: "always" | "conditional"; delay_seconds: number };
+type Settings = { enabled: boolean; mode: "conditional"; delay_seconds: number };
 type Status = {
   phase: string;
   reason?: string;
@@ -11,6 +11,7 @@ type Status = {
   settings_error?: string;
   host?: { product: string; os_version: string; kernel: string };
   monitor?: string;
+  screen_locked?: boolean;
   last_check?: { time: number; health: string; reason: string } | null;
   last_result?: { time: number; outcome: string; reason: string; error?: string } | null;
   log_path?: string;
@@ -18,9 +19,10 @@ type Status = {
 
 const getStatus = callable<[], Status>("get_status");
 const updateSettings = callable<[settings: Partial<Settings>], Status>("update_settings");
+const setLockState = callable<[locked: boolean], Status>("set_lock_state");
 
 const phases: Record<string, string> = {
-  starting: "正在启动", idle: "已就绪，等待下次唤醒", disabled: "自动恢复已关闭",
+  starting: "正在启动", idle: "已就绪，等待下次唤醒", disabled: "自动恢复已关闭", locked: "锁屏中，不执行检测",
   unsupported: "当前环境不支持自动恢复", sleeping: "系统正在休眠", waiting: "唤醒后等待设备恢复",
   recovering: "正在重启 InputPlumber", verifying: "正在复查输入链路",
   observed: "输入链路结构正常", attempted: "已尝试恢复，输入链路结构正常",
@@ -96,16 +98,11 @@ function Content() {
       {settings && <>
         <PanelSectionRow>
           <ToggleField label="自动恢复" checked={settings.enabled} disabled={saving}
-            description="系统唤醒后自动检查并按所选策略尝试恢复。"
+            description="休眠时不干预；唤醒后先等待 SteamOS 自行恢复，仅在输入链路连续检测异常时重启 InputPlumber。"
             onChange={(enabled) => { void save({ enabled }); }} />
         </PanelSectionRow>
         <PanelSectionRow>
-          <ToggleField label="每次唤醒都尝试恢复" checked={settings.mode === "always"} disabled={saving}
-            description="默认开启，以覆盖已连接但无响应的情况。会重启 InputPlumber，其管理的其他手柄也可能短暂断连。关闭后仅在连续检测到异常时恢复。"
-            onChange={(enabled) => { void save({ mode: enabled ? "always" : "conditional" }); }} />
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <SliderField label="唤醒后等待时间" value={settings.delay_seconds} min={3} max={15} step={1}
+          <SliderField label="SteamOS 自恢复等待时间" value={settings.delay_seconds} min={3} max={15} step={1}
             disabled={saving} showValue valueSuffix=" 秒"
             onChange={(delay_seconds) => { void save({ delay_seconds: Math.round(delay_seconds) }); }} />
         </PanelSectionRow>
@@ -133,16 +130,48 @@ function Content() {
           <div>{status.host?.product || "设备信息加载中"}</div>
           {status.host && <div>SteamOS {status.host.os_version} · {status.host.kernel}</div>}
           <div style={{ marginTop: 8 }}>诊断自动保存：{status.log_path || "加载中"}</div>
-          <div style={{ marginTop: 8 }}>0.1.1 实验版 · 已修复真机发现的系统工具动态库冲突，恢复效果待复测。</div>
+          <div style={{ marginTop: 8 }}>0.1.2 实验版 · 锁屏不探测，解锁后仅在输入链路持续异常时恢复。</div>
         </div>
       </PanelSectionRow>
     </PanelSection>
   </>;
 }
 
-export default definePlugin(() => ({
-  name: "DeckyAlly",
-  titleView: <div className={staticClasses.Title}>DeckyAlly</div>,
-  content: <Content />,
-  icon: <FaGamepad />,
-}));
+export default definePlugin(() => {
+  let lastLockState: boolean | undefined;
+  let lastLockSync = 0;
+  let syncingLockState = false;
+  const syncLockState = (force = false) => {
+    try {
+      const detector = window.securitystore?.IsLockScreenActive;
+      if (typeof detector !== "function") return;
+      const locked = Boolean(detector.call(window.securitystore));
+      const stale = Date.now() - lastLockSync >= 10000;
+      if ((force || stale || locked !== lastLockState) && !syncingLockState) {
+        syncingLockState = true;
+        void setLockState(locked)
+          .then(() => { lastLockState = locked; lastLockSync = Date.now(); })
+          .catch(() => undefined)
+          .finally(() => { syncingLockState = false; });
+      }
+    } catch {
+      // Older Steam clients may not expose the store; the backend remains conservative.
+    }
+  };
+  syncLockState(true);
+  const lockTimer = setInterval(() => syncLockState(), 1000);
+  const refreshLockState = () => syncLockState(true);
+  window.addEventListener("focus", refreshLockState);
+  document.addEventListener("visibilitychange", refreshLockState);
+  return {
+    name: "DeckyAlly",
+    titleView: <div className={staticClasses.Title}>DeckyAlly</div>,
+    content: <Content />,
+    icon: <FaGamepad />,
+    onDismount() {
+      clearInterval(lockTimer);
+      window.removeEventListener("focus", refreshLockState);
+      document.removeEventListener("visibilitychange", refreshLockState);
+    },
+  };
+});

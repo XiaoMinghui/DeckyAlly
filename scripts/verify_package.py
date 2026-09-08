@@ -38,7 +38,7 @@ def verify():
             "spec = importlib.util.spec_from_file_location('plugin', 'main.py'); "
             "module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); "
             "from decky_ally.recovery import DEFAULTS; "
-            "assert DEFAULTS['enabled'] and DEFAULTS['mode'] == 'always'; "
+            "assert DEFAULTS == {'enabled': True, 'mode': 'conditional', 'delay_seconds': 8}; "
             "assert hasattr(module.Plugin, '_main') and hasattr(module.Plugin, '_unload'); "
             "assert not hasattr(module.Plugin, 'restart'); "
             "print('Packaged backend imports successfully')"

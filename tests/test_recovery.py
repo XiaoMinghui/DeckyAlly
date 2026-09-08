@@ -134,10 +134,14 @@ class ProbeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "settings.json"
             self.assertTrue(load_settings(path)[0]["enabled"])
+            self.assertEqual(load_settings(path)[0]["mode"], "conditional")
+            self.assertEqual(load_settings(path)[0]["delay_seconds"], 8)
             path.write_text("{broken", encoding="utf-8")
             self.assertFalse(load_settings(path)[0]["enabled"])
             atomic_json(path, {"enabled": False})
             self.assertFalse(load_settings(path)[0]["enabled"])
+            atomic_json(path, {"enabled": True, "mode": "always", "delay_seconds": 5})
+            self.assertEqual(load_settings(path)[0]["mode"], "conditional")
 
 
 class RecoveryTests(unittest.IsolatedAsyncioTestCase):
@@ -152,10 +156,12 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.sleep_patch = patch("decky_ally.recovery.asyncio.sleep", fast_sleep)
         self.sleep_patch.start()
 
-    def engine(self, snapshots=None):
+    def engine(self, snapshots=None, unlocked=True):
         system = FakeSystem(snapshots)
         root = Path(self.tmp.name)
         engine = Recovery(system, root / "settings", root / "logs", root / "data")
+        if unlocked:
+            engine.set_lock_state(False)
         self.engines.append(engine)
         return engine
 
@@ -166,12 +172,11 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.run_patch.stop()
         self.tmp.cleanup()
 
-    async def test_default_covers_connected_but_unresponsive(self):
+    async def test_default_leaves_normal_wake_alone(self):
         engine = self.engine()
         await engine.recover("test")
-        self.assertEqual(engine.system.restarts, 1)
-        self.assertEqual(engine.state["last_result"]["outcome"], "attempted")
-        self.assertIn("unverified", engine.state["reason"])
+        self.assertEqual(engine.system.restarts, 0)
+        self.assertEqual(engine.state["last_result"]["outcome"], "observed")
 
     async def test_conditional_leaves_normal_wake_alone(self):
         engine = self.engine()
@@ -201,11 +206,11 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.state["phase"], "unknown")
         self.assertEqual(engine.system.restarts, 0)
 
-    async def test_probe_timeout_does_not_block_always_mode(self):
+    async def test_probe_timeout_does_not_restart_uncertain_device(self):
         engine = self.engine()
         engine.system.snapshot = AsyncMock(side_effect=asyncio.TimeoutError)
         await engine.recover("test")
-        self.assertEqual(engine.system.restarts, 1)
+        self.assertEqual(engine.system.restarts, 0)
         self.assertEqual(engine.state["phase"], "unknown")
 
     async def test_missing_hardware_remains_failed_without_loop(self):
@@ -217,13 +222,13 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.state["phase"], "failed")
 
     async def test_command_failure_is_not_reported_as_recovery(self):
-        engine = self.engine()
+        engine = self.engine([broken()])
         engine.system.restart_result = {"code": 1, "out": "", "error": "permission denied"}
         await engine.recover("test")
         self.assertEqual(engine.state["reason"], "restart_command_failed")
 
     async def test_service_guards(self):
-        engine = self.engine()
+        engine = self.engine([broken()])
         for service in ({"LoadState": "not-found"},
                         {"LoadState": "loaded", "ActiveState": "active", "UnitFileState": "masked"},
                         {"LoadState": "loaded", "ActiveState": "inactive"},
@@ -234,16 +239,16 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(engine.system.restarts, 0)
 
     async def test_hhd_conflict_blocks_restart(self):
-        engine = self.engine()
+        engine = self.engine([broken()])
         self.run_mock.return_value = {"code": 0, "out": "hhd@deck.service loaded active running HHD", "error": ""}
         await engine.recover("test")
         self.assertEqual(engine.state["reason"], "hhd_conflict")
         self.assertEqual(engine.system.restarts, 0)
 
     async def test_cooldown_survives_backend_reload(self):
-        engine = self.engine()
+        engine = self.engine([broken()])
         await engine.recover("test")
-        other = self.engine()
+        other = self.engine([broken()])
         await other.recover("test")
         self.assertEqual(other.system.restarts, 0)
         self.assertEqual(other.state["reason"], "cooldown")
@@ -253,7 +258,8 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         engine.resume("clock")
         engine.resume("logind")
         await engine.cycle
-        self.assertEqual(engine.system.restarts, 1)
+        self.assertEqual(engine.system.index, 1)
+        self.assertEqual(engine.system.restarts, 0)
 
     async def test_second_suspend_cancels_first_cycle_then_allows_new_wake(self):
         engine = self.engine()
@@ -261,9 +267,79 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         previous = engine.cycle
         engine.sleep_event(True)
         engine.sleep_event(False)
+        self.assertTrue(engine.screen_locked)
+        self.assertFalse(engine.lock_state_known)
+        self.assertEqual(engine.system.index, 0)
+        engine.set_lock_state(False)
         self.assertIsNot(previous, engine.cycle)
         await engine.cycle
-        self.assertEqual(engine.system.restarts, 1)
+        self.assertEqual(engine.system.index, 1)
+        self.assertEqual(engine.system.restarts, 0)
+
+    async def test_resume_waits_for_unlock_before_checking(self):
+        engine = self.engine(unlocked=False)
+        engine.resume("logind")
+        await REAL_SLEEP(0)
+        self.assertEqual(engine.state["phase"], "locked")
+        self.assertFalse(engine.lock_state_known)
+        self.assertEqual(engine.system.index, 0)
+        engine.set_lock_state(False)
+        await engine.cycle
+        self.assertEqual(engine.system.index, 1)
+        self.assertEqual(engine.system.restarts, 0)
+
+    async def test_lock_cancels_inflight_baseline_probe(self):
+        engine = self.engine()
+        started = asyncio.Event()
+
+        async def probing():
+            started.set()
+            await asyncio.Event().wait()
+
+        engine.baseline_probe = asyncio.create_task(probing())
+        await started.wait()
+        engine.set_lock_state(True)
+        await asyncio.gather(engine.baseline_probe, return_exceptions=True)
+        self.assertTrue(engine.baseline_probe.cancelled())
+        self.assertEqual(engine.state["phase"], "locked")
+        self.assertEqual(engine.system.restarts, 0)
+
+    async def test_lock_interrupts_active_cycle_and_retries_after_unlock(self):
+        engine = self.engine()
+        started = asyncio.Event()
+
+        async def active_cycle():
+            started.set()
+            await asyncio.Event().wait()
+
+        previous = asyncio.create_task(active_cycle())
+        engine.cycle = previous
+        engine.cycle_source = "logind"
+        await started.wait()
+        engine.set_lock_state(True)
+        await asyncio.gather(previous, return_exceptions=True)
+        self.assertTrue(previous.cancelled())
+        self.assertEqual(engine.system.index, 0)
+        engine.set_lock_state(False)
+        await engine.cycle
+        self.assertEqual(engine.system.index, 1)
+        self.assertEqual(engine.system.restarts, 0)
+
+    async def test_suspend_cancels_inflight_baseline_probe(self):
+        engine = self.engine()
+        started = asyncio.Event()
+
+        async def probing():
+            started.set()
+            await asyncio.Event().wait()
+
+        engine.baseline_probe = asyncio.create_task(probing())
+        await started.wait()
+        engine.sleep_event(True)
+        await asyncio.gather(engine.baseline_probe, return_exceptions=True)
+        self.assertTrue(engine.baseline_probe.cancelled())
+        self.assertEqual(engine.state["phase"], "sleeping")
+        self.assertEqual(engine.system.restarts, 0)
 
     async def test_disable_cancels_pending_cycle_and_persists(self):
         engine = self.engine()
@@ -287,6 +363,8 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         engine = self.engine()
         engine.system.host = {"supported": False}
         await engine.start()
+        self.assertEqual(engine.state["phase"], "unsupported")
+        engine.set_lock_state(True)
         self.assertEqual(engine.state["phase"], "unsupported")
         self.assertEqual(engine.tasks, [])
         self.run_mock.assert_not_called()
@@ -345,7 +423,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         first = self.engine()
         first.runtime_path.parent.mkdir(parents=True, exist_ok=True)
         first.runtime_path.write_text("broken", encoding="utf-8")
-        engine = self.engine()
+        engine = self.engine([broken()])
         await engine.recover("test")
         self.assertEqual(engine.system.restarts, 0)
         self.assertEqual(engine.state["reason"], "runtime_state_invalid")
