@@ -1,0 +1,10 @@
+{
+  "name": "DeckyAlly",
+  "author": "DeckyAlly contributors",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["hardware", "rog-ally", "controller"],
+    "description": "ROG Ally X 在 SteamOS 下的后台唤醒手柄恢复与诊断。"
+  }
+}
