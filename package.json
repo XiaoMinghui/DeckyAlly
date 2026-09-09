@@ -1,8 +1,8 @@
 {
   "name": "decky-ally",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
-  "description": "Automatic post-resume controller recovery for ROG Ally X on SteamOS",
+  "description": "Controller recovery and RGB lighting for ROG Ally X on SteamOS",
   "type": "module",
   "license": "MIT",
   "scripts": {

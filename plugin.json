@@ -4,7 +4,7 @@
   "flags": ["root"],
   "api_version": 1,
   "publish": {
-    "tags": ["hardware", "rog-ally", "controller"],
-    "description": "ROG Ally X 在 SteamOS 下的后台唤醒手柄恢复与诊断。"
+    "tags": ["hardware", "rog-ally", "controller", "rgb"],
+    "description": "ROG Ally X 在 SteamOS 下的唤醒手柄恢复、摇杆灯光控制与诊断。"
   }
 }
